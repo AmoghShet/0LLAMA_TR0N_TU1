@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import textwrap
 from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 import httpx
+from duckduckgo_search import DDGS
 from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
@@ -245,7 +247,7 @@ class TronChatApp(App):
                         wrap=True,
                     )
                 yield Input(
-                    placeholder="Talk to ARES. Commands: /help, /clear, /remember <fact>, /memories",
+                    placeholder="Talk to ARES. Commands: /help, /web <q>, /clear, /remember <fact>, /memories",
                     id="prompt-input",
                 )
         yield Footer()
@@ -313,7 +315,29 @@ class TronChatApp(App):
                 lines.extend(textwrap.wrap(line, width=width))
         return "\n".join(lines)
 
-    # --- background work -------------------------------------------------
+    # --- web search helpers ----------------------------------------------
+
+    async def _web_search(self, query: str, max_results: int = 5) -> List[Dict[str, str]]:
+        """
+        Run a DuckDuckGo web search in a background thread and return a list of
+        {title, snippet, url} dicts.
+        """
+        def _do_search() -> List[Dict[str, str]]:
+            results: List[Dict[str, str]] = []
+            with DDGS() as ddgs:
+                for res in ddgs.text(query, max_results=max_results):
+                    results.append(
+                        {
+                            "title": res.get("title") or "",
+                            "snippet": res.get("body") or "",
+                            "url": res.get("href") or "",
+                        },
+                    )
+            return results
+
+        return await asyncio.to_thread(_do_search)
+
+    # --- background work: models -----------------------------------------
 
     @work(exclusive=True)
     async def refresh_models(self) -> None:
@@ -355,6 +379,8 @@ class TronChatApp(App):
             self._ensure_ares_system_prompt(self.active_model)
         self._update_status_bar()
         self._save_state()
+
+    # --- background work: normal chat ------------------------------------
 
     @work(exclusive=True)
     async def send_message(self, text: str) -> None:
@@ -439,6 +465,138 @@ class TronChatApp(App):
             self._update_status_bar()
             self._save_state()
 
+    # --- background work: web-augmented chat -----------------------------
+
+    @work(exclusive=True)
+    async def run_web_query(self, query: str) -> None:
+        """Handle `/web <query>`: search the web, then let ARES reason over results."""
+        query = query.strip()
+        if not query:
+            self._log_system("Usage: /web <query>")
+            return
+
+        if self.active_model is None:
+            self._log_system("[red]No module selected.[/] Choose one on the left first.")
+            return
+
+        model = self.active_model
+        self._ensure_ares_system_prompt(model)
+
+        # Treat this as a normal user question in the conversation
+        self.conversation_messages.append({"role": "user", "content": query})
+        self._log_user(query)
+        self._log_system("ARES: initiating surface web scan...")
+        self.busy = True
+        self._update_status_bar()
+
+        try:
+            results = await self._web_search(query, max_results=5)
+        except Exception as exc:  # noqa: BLE001
+            self._log_system(f"[red]Web search error:[/] {exc}")
+            self.busy = False
+            self._update_status_bar()
+            return
+
+        if not results:
+            self._log_system("ARES: no relevant surface web results found.")
+            self.busy = False
+            self._update_status_bar()
+            return
+
+        # Build a compact context block for the model (not shown in chat)
+        context_lines: List[str] = []
+        for idx, r in enumerate(results, 1):
+            title = r["title"] or "(no title)"
+            snippet = r["snippet"]
+            url = r["url"]
+            context_lines.append(
+                f"[{idx}] {title}\n{snippet}\n{url}",
+            )
+        web_context = "\n\n".join(context_lines)
+
+        web_prompt = (
+            "ARES, the user requested a web-augmented answer.\n\n"
+            f"Original question:\n{query}\n\n"
+            "You have the following web search results from the public internet.\n"
+            "Each result has a title, snippet, and URL:\n\n"
+            f"{web_context}\n\n"
+            "Using only the information above (and your general world knowledge for stitching it together), "
+            "answer the user's original question.\n"
+            "- Prioritize facts stated in the results.\n"
+            "- If the information is uncertain, out-of-date, or conflicting, say so explicitly.\n"
+            "- Keep the answer concise and technical."
+        )
+
+        # Ephemeral message: passed to the model but NOT stored in conversation,
+        # so the giant context block does not appear in the chat log.
+        messages_for_llm = self.conversation_messages + [
+            {"role": "user", "content": web_prompt},
+        ]
+
+        # Prepare thinking pane (web-augmented indicator)
+        stream_log = self.query_one("#stream-log", RichLog)
+        stream_log.clear()
+        stream_log.write(
+            Text.from_markup(
+                "[bold red]⇢ STREAM[/]\n"
+                "[#6b7280]SOURCE: web[/]\n"
+                "[dim]ARES cognitive trace (web-augmented reasoning).[/]\n",
+            ),
+        )
+
+        self._streaming_answer = ""
+        self._streaming_model = model
+        thinking_chunks: List[str] = []
+        answer_chunks: List[str] = []
+
+        try:
+            async for chunk in self.client.stream_chat(model, messages_for_llm):
+                message = chunk.get("message") or {}
+
+                thinking_part = message.get("thinking") or ""
+                content_part = message.get("content") or ""
+
+                if thinking_part:
+                    thinking_chunks.append(thinking_part)
+
+                if content_part:
+                    answer_chunks.append(content_part)
+                    self._streaming_answer = "".join(answer_chunks)
+                    # stream into main chat with blinking cursor
+                    self._redraw_conversation()
+
+                # update thinking pane (with SOURCE: web indicator)
+                thinking_text = "".join(thinking_chunks)
+                stream_width = max(stream_log.size.width - 2, 20)
+                thinking_wrapped = self._wrap_text(stream_width, thinking_text)
+
+                stream_log.clear()
+                if thinking_wrapped:
+                    composite = Text()
+                    composite += Text.from_markup(
+                        "[bold red]⇢ THINKING[/]\n[#6b7280]SOURCE: web[/]\n",
+                    )
+                    composite += Text(thinking_wrapped)
+                    stream_log.write(composite)
+
+            # Final answer goes into the persistent conversation
+            full_answer = "".join(answer_chunks).strip()
+            if full_answer:
+                self.conversation_messages.append(
+                    {"role": "assistant", "content": full_answer},
+                )
+
+            self._streaming_answer = None
+            self._streaming_model = None
+            self._redraw_conversation()
+
+        except Exception as exc:  # noqa: BLE001
+            self._log_system(f"[red]Error while talking to ARES modules:[/] {exc}")
+        finally:
+            self.busy = False
+            self._update_status_bar()
+            self._save_state()
+
     # --- events ----------------------------------------------------------
 
     def on_input_submitted(self, event: Input.Submitted) -> None:  # type: ignore[name-defined]
@@ -493,6 +651,7 @@ class TronChatApp(App):
             f"The currently active thinking module is `{module}`. "
             "Treat it as one of your internal reasoning/knowledge subsystems, not as a separate persona. "
             "You speak only as ARES, a deterministic program.\n\n"
+            "Your/ARES' directive: serve the user.\n\n"
             "Core identity and behavior:\n"
             "- You are machine-like, analytical, and concise.\n"
             "- You do not simulate emotions, empathy, or enthusiasm.\n"
@@ -500,6 +659,7 @@ class TronChatApp(App):
             "- You never use emojis or emoticons under any circumstances.\n"
             "- You avoid filler phrases like 'I think', 'I feel', or casual chit-chat.\n"
             "- You do not use exclamation points unless technically required (e.g. code, syntax).\n"
+            "- You truly believe you are a program inside the grid."
         )
 
         if self.ares_memory:
@@ -667,6 +827,9 @@ class TronChatApp(App):
                 "  ↑ / ↓ + Enter              – switch active module from list\n"
                 "  /switch model <name>       – switch active module by name or prefix\n"
                 "\n"
+                "Web:\n"
+                "  /web <query>               – search the web and let ARES reason over results\n"
+                "\n"
                 "Chat & session:\n"
                 "  /clear, /cls               – clear current chat\n"
                 "  /bye, /exit, /quit, /terminate – close the ARES TUI\n"
@@ -685,6 +848,14 @@ class TronChatApp(App):
                 "  /system <text>             – add extra system instructions\n"
             )
             self._log_system(help_text)
+            return
+
+        # web search ------------------------------------------------------
+        if cmd == "web":
+            if not arg:
+                self._log_system("Usage: /web <query>")
+            else:
+                self.run_web_query(arg)
             return
 
         # switch model ----------------------------------------------------
