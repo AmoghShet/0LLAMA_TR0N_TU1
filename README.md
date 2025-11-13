@@ -13,6 +13,7 @@ The app streams model thinking (cognitive trace) and assistant responses, suppor
 * Shared conversation history (session-only) + persistent ARES memory items
 * Keyboard shortcuts and slash commands for quick control
 * Minimal, Tron-themed UI using `textual` + `rich`
+* Ability to browse the web via DuckDuckGo
 
 ---
 
@@ -91,6 +92,7 @@ Chat & session
 ```
 /clear, /cls                   — clear current chat
 /bye, /exit, /quit, /terminate — close the TUI
+/web                           — perform a web search
 ```
 
 Memory
