@@ -22,6 +22,10 @@ from textual.widgets import (
     Label,
     Footer,
 )
+try:
+    import psutil  
+except Exception: 
+    psutil = None
 
 STATE_PATH = Path.home() / ".tron_ares_state.json"
 
@@ -763,12 +767,55 @@ class TronChatApp(App):
         self._update_ares_status()
 
     def _update_ares_status(self) -> None:
-        """Single line: idle/thinking + fake stats."""
+        """Single line: idle/thinking + real CPU/MEM, best-effort TEMP."""
         bar = self.query_one("#ares-status", Static)
-        self._stat_counter += 1
-        cpu = 3 + (self._stat_counter % 7)
-        mem = 128 + (self._stat_counter % 32)
-        temp = 30 + (self._stat_counter % 5)
+
+        cpu_display = "??"
+        mem_display = "??"
+        temp_display = "??"
+
+        if psutil is not None:
+            try:
+                # system-wide CPU percent (non-blocking)
+                cpu_percent = int(psutil.cpu_percent(interval=None))
+
+                # system-wide memory usage
+                vm = psutil.virtual_memory()
+                mem_used_mb = int(vm.used / (1024 * 1024))
+
+                cpu_display = f"{cpu_percent:02d}%"
+                mem_display = f"{mem_used_mb}MB"
+
+                # temperature: only available on some platforms (often Linux)
+                temp_value: Optional[int] = None
+                temps = getattr(psutil, "sensors_temperatures", lambda: {})()
+                if temps:
+                    readings = [
+                        sensor.current
+                        for group in temps.values()
+                        for sensor in group
+                        if getattr(sensor, "current", None) is not None
+                    ]
+                    if readings:
+                        temp_value = int(sum(readings) / len(readings))
+
+                # if we couldn't get real temp (e.g. macOS), derive a soft estimate
+                if temp_value is None:
+                    temp_value = 30 + int(cpu_percent * 0.5)
+
+                temp_display = f"{temp_value}°C"
+            except Exception:
+                # fall back to deterministic fake stats if psutil misbehaves
+                self._stat_counter += 1
+                cpu_display = f"{3 + (self._stat_counter % 7):02d}%"
+                mem_display = f"{128 + (self._stat_counter % 32)}MB"
+                temp_display = f"{30 + (self._stat_counter % 5)}°C"
+        else:
+            # psutil not available: keep the old fake animation
+            self._stat_counter += 1
+            cpu_display = f"{3 + (self._stat_counter % 7):02d}%"
+            mem_display = f"{128 + (self._stat_counter % 32)}MB"
+            temp_display = f"{30 + (self._stat_counter % 5)}°C"
 
         if self.busy:
             frames = ["◐", "◓", "◑", "◒"]
@@ -779,7 +826,7 @@ class TronChatApp(App):
 
         text = Text.from_markup(
             f"[#facc15]{state}[/]   "
-            f"[#6b7280]CPU {cpu:02d}%   MEM {mem}MB   GRID TEMP {temp}°C[/]",
+            f"[#6b7280]CPU {cpu_display}   MEM {mem_display}   GRID TEMP {temp_display}[/]",
         )
         bar.update(text)
 
